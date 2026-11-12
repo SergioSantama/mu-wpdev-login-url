@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WPDev Login URL
  * Description: Sirve el login del multisite wpdev en /acceso-admin (también en cada subsitio y en cada dominio mapeado de la red), oculta /wp-login.php (404) y redirige /wp-admin al login nuevo.
- * Version: 2.1.1
+ * Version: 2.2.0
  * Author: Sergio Santamaria
  * License: GPL-2.0-or-later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -160,6 +160,119 @@ function wpdev_login_allowed_actions(): array {
 }
 
 /**
+ * Host (normalizado) de la petición actual.
+ *
+ * @return string
+ */
+function wpdev_login_current_host(): string {
+	return isset( $_SERVER['HTTP_HOST'] ) ? wpdev_login_normalize_host( (string) wp_unslash( $_SERVER['HTTP_HOST'] ) ) : '';
+}
+
+/**
+ * admin_url() del blog actual, garantizando que apunta al host actual.
+ *
+ * WordPress 7.1 cambió `wp_validate_redirect()`: ya NO devuelve el fallback
+ * cuando la URL de entrada es una cadena vacía (devuelve ''). Por eso el
+ * fallback se calcula aquí y se aplica siempre que haga falta.
+ *
+ * @return string
+ */
+function wpdev_login_current_admin_url(): string {
+	$admin = (string) admin_url();
+
+	if ( '' !== $admin ) {
+		return $admin;
+	}
+
+	$host = wpdev_login_current_host();
+
+	if ( '' === $host ) {
+		return '';
+	}
+
+	$blog_path = '/';
+
+	if ( function_exists( 'get_blog_details' ) ) {
+		$blog = get_blog_details();
+
+		if ( is_object( $blog ) && ! empty( $blog->path ) ) {
+			$blog_path = trailingslashit( (string) $blog->path );
+		}
+	}
+
+	return ( is_ssl() ? 'https' : 'http' ) . '://' . $host . $blog_path . 'wp-admin/';
+}
+
+/**
+ * Redirige SIEMPRE al dashboard del blog actual en SU dominio y nunca deja
+ * una pantalla en blanco:
+ *
+ * 1. Valida el destino y, si viene vacío o apunta a otro host de la red,
+ *    usa el admin_url() del blog actual.
+ * 2. Autoriza el host en `allowed_redirect_hosts` (red multisite) para que
+ *    wp_safe_redirect() no lo rechace.
+ * 3. Si wp_safe_redirect() falla (p. ej. output previo de otro plugin), cae
+ *    a wp_redirect() con el destino ya validado y, si tampoco, pinta una
+ *    página de continuación con enlace + meta refresh.
+ *
+ * @param string $target   Destino solicitado (puede venir vacío).
+ * @param int    $ob_level Nivel de output buffering previo al nuestro.
+ * @return void
+ */
+function wpdev_login_redirect( string $target, int $ob_level = 0 ): void {
+	$fallback = wpdev_login_current_admin_url();
+
+	$target = (string) wp_validate_redirect( $target, $fallback );
+
+	if ( '' === $target ) {
+		$target = $fallback;
+	}
+
+	$current_host = wpdev_login_current_host();
+	$target_host  = strtolower( (string) wp_parse_url( $target, PHP_URL_HOST ) );
+
+	/*
+	 * Un redirect_to de otro host de la red abriría el dashboard del blog
+	 * equivocado; el login siempre deja al usuario en el blog actual.
+	 */
+	if ( '' === $target_host || $target_host !== $current_host ) {
+		$target      = $fallback;
+		$target_host = $current_host;
+	}
+
+	// Descarta cualquier output que un plugin haya emitido durante wp_signon().
+	while ( ob_get_level() > $ob_level ) {
+		ob_end_clean();
+	}
+
+	$allow_host = static function ( $hosts ) use ( $target_host ) {
+		$hosts   = (array) $hosts;
+		$hosts[] = $target_host;
+
+		return array_values( array_unique( $hosts ) );
+	};
+
+	add_filter( 'allowed_redirect_hosts', $allow_host );
+	$redirected = wp_safe_redirect( $target );
+	remove_filter( 'allowed_redirect_hosts', $allow_host );
+
+	if ( ! $redirected && in_array( $target_host, wpdev_login_scope_hosts(), true ) ) {
+		$redirected = wp_redirect( $target ); // phpcs:ignore WordPress.Security.SafeRedirect.wp_redirect_wp_redirect -- Destino validado contra los hosts de la red.
+	}
+
+	if ( ! $redirected ) {
+		// Último recurso: nunca pantalla en blanco.
+		status_header( 200 );
+		nocache_headers();
+		header( 'Content-Type: text/html; charset=utf-8', true );
+		header( 'X-Robots-Tag: noindex, nofollow', true );
+		echo '<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=' . esc_url( $target ) . '"><meta name="robots" content="noindex,nofollow"><title>Acceso</title></head><body><p>Acceso correcto. <a href="' . esc_url( $target ) . '">Continuar al panel</a>.</p></body></html>';
+	}
+
+	exit;
+}
+
+/**
  * Sustituye /wp-login.php por /acceso-admin en las URLs de login.
  *
  * @param string $login_url    URL de login generada por WordPress.
@@ -182,13 +295,25 @@ add_filter( 'login_url', 'wpdev_login_filter_login_url', 10, 3 );
  * @return void
  */
 function wpdev_login_render(): void {
+	/*
+	 * Buffer propio: si un plugin escribe durante wp_signon(), se descarta
+	 * antes de redirigir para no romper la cabecera Location (pantalla blanca).
+	 */
+	$ob_level = ob_get_level();
+	ob_start();
+
 	nocache_headers();
 	header( 'X-Robots-Tag: noindex, nofollow', true );
 	header( 'Referrer-Policy: no-referrer', true );
 
+	$fallback    = wpdev_login_current_admin_url();
 	$error       = '';
 	$redirect_to = isset( $_REQUEST['redirect_to'] ) ? (string) wp_unslash( $_REQUEST['redirect_to'] ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Solo alimenta wp_validate_redirect.
-	$redirect_to = wp_validate_redirect( $redirect_to, admin_url() );
+	$redirect_to = (string) wp_validate_redirect( $redirect_to, $fallback );
+
+	if ( '' === $redirect_to ) {
+		$redirect_to = $fallback;
+	}
 
 	if ( 'POST' === ( $_SERVER['REQUEST_METHOD'] ?? 'GET' ) ) {
 		$nonce = isset( $_POST['_wpdev_login_nonce'] ) ? (string) $_POST['_wpdev_login_nonce'] : '';
@@ -211,13 +336,11 @@ function wpdev_login_render(): void {
 			if ( is_wp_error( $user ) ) {
 				$error = 'Usuario o contraseña incorrectos.';
 			} else {
-				wp_safe_redirect( $redirect_to );
-				exit;
+				wpdev_login_redirect( $redirect_to, $ob_level );
 			}
 		}
 	} elseif ( is_user_logged_in() ) {
-		wp_safe_redirect( $redirect_to );
-		exit;
+		wpdev_login_redirect( $redirect_to, $ob_level );
 	}
 
 	status_header( 200 );
@@ -298,21 +421,32 @@ function wpdev_login_intercept(): void {
 		return;
 	}
 
-	// /wp-admin sin sesion -> 404 (no revelar la URL del login a un atacante).
-	if ( 'wp-admin' === $base && ! wpdev_login_is_internal_request() ) {
-		$req = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
+	/*
+	 * /wp-admin (directorio) SIN sesión -> 404 (no revelar la URL del login a
+	 * un atacante). CON sesión -> se deja a WordPress: el dashboard se sirve
+	 * normalmente. Sin este return, el bloque 404 final también mataba
+	 * /wp-admin/ con sesión iniciada (bug de la v2.1.1).
+	 */
+	if ( 'wp-admin' === $base ) {
+		$req    = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
 		$is_api = ( false !== strpos( $req, 'admin-ajax' ) || false !== strpos( $req, 'admin-post' ) );
-		if ( ! $is_api ) {
-			require_once ABSPATH . 'wp-includes/pluggable.php';
-			if ( ! is_user_logged_in() ) {
-				status_header( 404 );
-				nocache_headers();
-				header( 'Content-Type: text/html; charset=utf-8', true );
-				header( 'X-Robots-Tag: noindex, nofollow', true );
-				echo '<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>';
-				exit;
-			}
+
+		if ( wpdev_login_is_internal_request() || $is_api ) {
+			return;
 		}
+
+		require_once ABSPATH . 'wp-includes/pluggable.php';
+
+		if ( ! is_user_logged_in() ) {
+			status_header( 404 );
+			nocache_headers();
+			header( 'Content-Type: text/html; charset=utf-8', true );
+			header( 'X-Robots-Tag: noindex, nofollow', true );
+			echo '<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>';
+			exit;
+		}
+
+		return;
 	}
 
 	if ( WPDEV_LOGIN_SLUG === $base ) {
