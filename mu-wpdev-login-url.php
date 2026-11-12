@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: WPDev Login URL
- * Description: Sirve el login del wpdev en /acceso-admin, oculta /wp-login.php (404) y redirige /wp-admin al login nuevo. Solo actúa en el host wpdev.sergiosantamaria.org.
- * Version: 1.0.0
+ * Description: Sirve el login del multisite wpdev en /acceso-admin (también en cada subsitio y en cada dominio mapeado de la red), oculta /wp-login.php (404) y redirige /wp-admin al login nuevo.
+ * Version: 2.0.0
  * Author: DigitalYa
  * License: GPL-2.0-or-later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Host al que se aplica el cambio de login.
+ * Host principal de la red (siempre en el alcance, aunque wp_blogs no esté disponible).
  */
 const WPDEV_LOGIN_HOST = 'wpdev.sergiosantamaria.org';
 
@@ -25,15 +25,90 @@ const WPDEV_LOGIN_HOST = 'wpdev.sergiosantamaria.org';
 const WPDEV_LOGIN_SLUG = 'acceso-admin';
 
 /**
- * ¿La petición actual va al host del wpdev?
+ * Normaliza un host: minúsculas, sin puerto y sin punto final.
+ *
+ * @param string $host Host en bruto (p. ej. de HTTP_HOST o de wp_blogs.domain).
+ * @return string
+ */
+function wpdev_login_normalize_host( string $host ): string {
+	$host = strtolower( trim( $host ) );
+	$host = (string) preg_replace( '/:\d+$/', '', $host );
+
+	return rtrim( $host, '.' );
+}
+
+/**
+ * Hosts donde se aplica el cambio de login: el host de la red + TODOS los
+ * dominios de los subsitios (incluidos los mapeados) leídos en runtime.
+ *
+ * Fuentes, en este orden:
+ * 1. `wp_blogs.domain` (multisite nativo; un dominio mapeado es una fila más).
+ * 2. `{base_prefix}wu_domain_mappings` (Ultimate Multisite, si la tabla existe).
+ * 3. Filtro `wpdev_login_scope_hosts` (escape operativo sin tocar el fichero).
+ *
+ * Nada está hardcodeado: un dominio mapeado nuevo entra solo.
+ *
+ * @return array<int,string>
+ */
+function wpdev_login_scope_hosts(): array {
+	static $hosts = null;
+
+	if ( null !== $hosts ) {
+		return $hosts;
+	}
+
+	$hosts = array( WPDEV_LOGIN_HOST );
+
+	global $wpdb;
+
+	if ( is_object( $wpdb ) && ! empty( $wpdb->blogs ) ) {
+		$domains = $wpdb->get_col( "SELECT DISTINCT domain FROM {$wpdb->blogs}" ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $wpdb->blogs es una propiedad de core.
+
+		if ( is_array( $domains ) ) {
+			foreach ( $domains as $domain ) {
+				$hosts[] = wpdev_login_normalize_host( (string) $domain );
+			}
+		}
+
+		/*
+		 * Dominios extra de Ultimate Multisite (dominio propio por site). La
+		 * tabla puede no existir si UM no está instalado o usa otro prefijo.
+		 */
+		$table = $wpdb->base_prefix . 'wu_domain_mappings';
+		$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Una consulta por petición de login.
+
+		if ( $exists ) {
+			$um_domains = $wpdb->get_col( "SELECT DISTINCT domain FROM {$table} WHERE active = 1" ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Nombre de tabla construido con el prefijo de core.
+
+			if ( is_array( $um_domains ) ) {
+				foreach ( $um_domains as $domain ) {
+					$hosts[] = wpdev_login_normalize_host( (string) $domain );
+				}
+			}
+		}
+	}
+
+	$hosts = array_values( array_unique( array_filter( $hosts ) ) );
+
+	/**
+	 * Permite añadir o quitar hosts del alcance sin editar el plugin.
+	 *
+	 * @param array<int,string> $hosts Hosts normalizados.
+	 */
+	$hosts = (array) apply_filters( 'wpdev_login_scope_hosts', $hosts );
+
+	return $hosts;
+}
+
+/**
+ * ¿La petición actual va a un host de la red (principal o dominio mapeado)?
  *
  * @return bool
  */
 function wpdev_login_is_scope(): bool {
-	$host = isset( $_SERVER['HTTP_HOST'] ) ? strtolower( (string) wp_unslash( $_SERVER['HTTP_HOST'] ) ) : '';
-	$host = preg_replace( '/:\d+$/', '', $host );
+	$host = isset( $_SERVER['HTTP_HOST'] ) ? wpdev_login_normalize_host( (string) wp_unslash( $_SERVER['HTTP_HOST'] ) ) : '';
 
-	return WPDEV_LOGIN_HOST === $host;
+	return in_array( $host, wpdev_login_scope_hosts(), true );
 }
 
 /**
@@ -206,22 +281,25 @@ function wpdev_login_render(): void {
  * Intercepta /acceso-admin y /wp-login.php antes de que WordPress resuelva
  * la query (init corre también en wp-login.php porque éste carga wp-load).
  *
+ * La comprobación de path va PRIMERO para no tocar la BD en el resto de
+ * peticiones (frontend, REST, cron).
+ *
  * @return void
  */
 function wpdev_login_intercept(): void {
+	$path = wpdev_login_request_path();
+	$base = basename( $path );
+
+	if ( WPDEV_LOGIN_SLUG !== $base && 'wp-login.php' !== $base ) {
+		return;
+	}
+
 	if ( ! wpdev_login_is_scope() ) {
 		return;
 	}
 
-	$path = wpdev_login_request_path();
-	$base = basename( $path );
-
 	if ( WPDEV_LOGIN_SLUG === $base ) {
 		wpdev_login_render();
-	}
-
-	if ( 'wp-login.php' !== $base ) {
-		return;
 	}
 
 	$action = isset( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( $_REQUEST['action'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Solo decide si se permite la acción nativa.

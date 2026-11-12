@@ -1,16 +1,21 @@
 # mu-wpdev-login-url
 
-Mu-plugin del multisite **wpdev** (`https://wpdev.sergiosantamaria.org`) que mueve el login
-de `/wp-login.php` a `/acceso-admin` para reducir la superficie de fuerza bruta.
+Mu-plugin del multisite **wpdev** que mueve el login de `/wp-login.php` a `/acceso-admin`
+para reducir la superficie de fuerza bruta. **v2.0.0: se aplica a toda la red** — el host
+principal, los subsitios por path y **todos los dominios mapeados** (hoy
+`bilbaosoftware.es`, `ite-bilbao.es`, `chiptuningbilbao.es`).
 
 ## Qué hace
 
 - Sirve el formulario de login en `https://wpdev.sergiosantamaria.org/acceso-admin`
-  (también en el path de cada subsitio en ese host: `/chb/acceso-admin`, etc.).
+  (también en el path de cada subsitio: `/chb/acceso-admin`) y en
+  `https://<dominio-mapeado>/acceso-admin` de cada subsitio con dominio propio.
 - `/wp-login.php` responde **404** para el formulario normal (`action` vacío o `action=login`).
-- `/wp-admin` sin sesión redirige al login nuevo (filtro `login_url` de WordPress).
-- Solo actúa cuando `HTTP_HOST` es `wpdev.sergiosantamaria.org`. Los dominios de cliente
-  (`chiptuningbilbao.es`, `ite-bilbao.es`, `bilbaosoftware.es`) mantienen su login nativo.
+- `/wp-admin` sin sesión redirige al login nuevo del MISMO host (filtro `login_url`).
+- **Alcance en runtime, nada hardcodeado:** los hosts válidos se leen de `wp_blogs.domain` y
+  de `{base_prefix}wu_domain_mappings` (Ultimate Multisite, si existe) en cada petición de
+  login. Un dominio mapeado nuevo entra solo. Escape operativo:
+  filtro `wpdev_login_scope_hosts`.
 
 ## Excepciones deliberadas
 
@@ -29,17 +34,26 @@ de `/wp-login.php` a `/acceso-admin` para reducir la superficie de fuerza bruta.
 - **wp-cron**: `/wp-cron.php` no pasa por el login.
 - **fail2ban**: el formulario usa `wp_signon()`, que dispara `wp_login` / `wp_login_failed`;
   `mu-wpdev-guard` sigue escribiendo el JSONL y el jail `wpdev-login` sigue baneando.
-- **Dominios de cliente**: fuera del host wpdev no se aplica nada.
+- **Rendimiento**: la comprobación de path va antes que cualquier consulta; solo las
+  peticiones a `/acceso-admin` y `/wp-login.php` tocan la BD.
 
-## Verificación (12-11)
+## ⚠ Cambio para los clientes (v2.0.0)
+
+Los clientes que hoy entran a `bilbaosoftware.es/wp-admin` (o ite / chb) pasan a ser enviados a
+`https://<su-dominio>/acceso-admin` y `/wp-login.php` les responde 404. Es el objetivo
+(anti-brute-force) pero **cambia la URL de acceso** que tienen guardada: conviene avisarles
+antes o al primer soporte.
+
+## Verificación
 
 ```text
+# en los 4 hosts (wpdev + 3 dominios mapeados)
 /wp-login.php                      -> 404
 /acceso-admin                      -> 200 (formulario)
 /wp-admin/ (sin sesión)            -> 302 /acceso-admin?redirect_to=...
 POST /acceso-admin (credenciales)  -> 302 /wp-admin/ ; GET /wp-admin/ -> 200 Dashboard
+# además en wpdev
 /chb/wp-login.php                  -> 404 ; /chb/acceso-admin -> 200
-https://bilbaosoftware.es/wp-login.php -> 200 (sin cambios)
 /wp-cron.php                       -> 200
 /wp-json/mcp/elementor-mcp-server initialize con app-password -> 200
 wp-login.php?action=lostpassword   -> 200
@@ -54,7 +68,8 @@ lectura por repo y alias SSH `github-mu-loginurl`.
 ## Rollback
 
 Borrar `wp-content/mu-plugins/mu-wpdev-login-url.php` (backups en
-`/home/ubuntu/wpdev-mu-backups/`) o revertir el commit. El login vuelve a `/wp-login.php`.
+`/home/ubuntu/wpdev-mu-backups/`) o revertir el commit. El login vuelve a `/wp-login.php` en
+toda la red.
 
 ## Licencia
 
