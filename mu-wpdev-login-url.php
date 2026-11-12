@@ -2,8 +2,8 @@
 /**
  * Plugin Name: WPDev Login URL
  * Description: Sirve el login del multisite wpdev en /acceso-admin (también en cada subsitio y en cada dominio mapeado de la red), oculta /wp-login.php (404) y redirige /wp-admin al login nuevo.
- * Version: 2.0.0
- * Author: DigitalYa
+ * Version: 2.1.1
+ * Author: Sergio Santamaria
  * License: GPL-2.0-or-later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  *
@@ -290,12 +290,29 @@ function wpdev_login_intercept(): void {
 	$path = wpdev_login_request_path();
 	$base = basename( $path );
 
-	if ( WPDEV_LOGIN_SLUG !== $base && 'wp-login.php' !== $base ) {
+	if ( WPDEV_LOGIN_SLUG !== $base && 'wp-login.php' !== $base && 'wp-admin' !== $base ) {
 		return;
 	}
 
 	if ( ! wpdev_login_is_scope() ) {
 		return;
+	}
+
+	// /wp-admin sin sesion -> 404 (no revelar la URL del login a un atacante).
+	if ( 'wp-admin' === $base && ! wpdev_login_is_internal_request() ) {
+		$req = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
+		$is_api = ( false !== strpos( $req, 'admin-ajax' ) || false !== strpos( $req, 'admin-post' ) );
+		if ( ! $is_api ) {
+			require_once ABSPATH . 'wp-includes/pluggable.php';
+			if ( ! is_user_logged_in() ) {
+				status_header( 404 );
+				nocache_headers();
+				header( 'Content-Type: text/html; charset=utf-8', true );
+				header( 'X-Robots-Tag: noindex, nofollow', true );
+				echo '<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>';
+				exit;
+			}
+		}
 	}
 
 	if ( WPDEV_LOGIN_SLUG === $base ) {
