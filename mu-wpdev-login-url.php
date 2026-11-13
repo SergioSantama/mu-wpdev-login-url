@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WPDev Login URL
  * Description: Sirve el login del multisite wpdev en /acceso-admin (también en cada subsitio y en cada dominio mapeado de la red), oculta /wp-login.php (404) y redirige /wp-admin al login nuevo.
- * Version: 2.2.0
+ * Version: 2.3.0
  * Author: Sergio Santamaria
  * License: GPL-2.0-or-later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -240,6 +240,13 @@ function wpdev_login_redirect( string $target, int $ob_level = 0 ): void {
 		$target_host = $current_host;
 	}
 
+	/*
+	 * v2.3.0: aterrizar en /wp-admin/index.php en vez de /wp-admin/ evita que
+	 * un 404 cacheado en el navegador para el directorio se coma el dashboard
+	 * justo después de un login correcto.
+	 */
+	$target = (string) preg_replace( '#/wp-admin/?$#', '/wp-admin/index.php', $target );
+
 	// Descarta cualquier output que un plugin haya emitido durante wp_signon().
 	while ( ob_get_level() > $ob_level ) {
 		ob_end_clean();
@@ -301,6 +308,28 @@ function wpdev_login_render(): void {
 	 */
 	$ob_level = ob_get_level();
 	ob_start();
+
+	/*
+	 * v2.3.0: limpia cookies de sesión caducadas o duplicadas (host-only +
+	 * domain) antes de pintar el formulario. Si el navegador conserva una
+	 * cookie vieja que WordPress no valida, el login correcto aterrizaba en
+	 * /wp-admin y el mu-plugin lo trataba como "sin sesión" -> bucle.
+	 */
+	if ( ! is_user_logged_in() ) {
+		foreach ( array_keys( $_COOKIE ) as $cookie_name ) {
+			$cookie_name = (string) $cookie_name;
+
+			if ( 0 !== strpos( $cookie_name, 'wordpress_logged_in_' ) && 0 !== strpos( $cookie_name, 'wordpress_sec_' ) ) {
+				continue;
+			}
+
+			setcookie( $cookie_name, '', time() - HOUR_IN_SECONDS, '/', '', is_ssl(), true );
+
+			if ( defined( 'COOKIE_DOMAIN' ) && COOKIE_DOMAIN ) {
+				setcookie( $cookie_name, '', time() - HOUR_IN_SECONDS, '/', COOKIE_DOMAIN, is_ssl(), true );
+			}
+		}
+	}
 
 	nocache_headers();
 	header( 'X-Robots-Tag: noindex, nofollow', true );
@@ -438,11 +467,26 @@ function wpdev_login_intercept(): void {
 		require_once ABSPATH . 'wp-includes/pluggable.php';
 
 		if ( ! is_user_logged_in() ) {
-			status_header( 404 );
+			/*
+			 * v2.3.0: en vez de un 404 seco (que dejaba al usuario en el bucle
+			 * login -> /wp-admin -> 404), se le lleva al login con el destino.
+			 * /wp-login.php sigue devolviendo 404.
+			 */
+			$blog_path = '/';
+
+			if ( function_exists( 'get_blog_details' ) ) {
+				$blog = get_blog_details();
+
+				if ( is_object( $blog ) && ! empty( $blog->path ) ) {
+					$blog_path = trailingslashit( (string) $blog->path );
+				}
+			}
+
+			$login_url = ( is_ssl() ? 'https' : 'http' ) . '://' . wpdev_login_current_host() . $blog_path . WPDEV_LOGIN_SLUG;
+			$target    = wpdev_login_current_admin_url();
+
 			nocache_headers();
-			header( 'Content-Type: text/html; charset=utf-8', true );
-			header( 'X-Robots-Tag: noindex, nofollow', true );
-			echo '<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>';
+			wp_safe_redirect( add_query_arg( 'redirect_to', $target, $login_url ) );
 			exit;
 		}
 
